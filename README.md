@@ -59,6 +59,7 @@ x-purged-count: 3
 | `xkey_zone <name>:<size>` | `http` | Shared memory zone holding the tag index |
 | `xkey_header <name>` | `http` | Response header listing tags, default `xkey` |
 | `xkey_purge <cache_zone>` | `location` | Turn this location into a purge endpoint for the named `proxy_cache_path` zone |
+| `xkey_purge_fallback on\|off` | `http`, `server`, `location` | Whether a tag missing from the index falls back to a directory scan. Default `on` |
 
 A purge endpoint answers the `PURGE` method only. Every other method gets
 `405` with an `Allow` header and touches nothing, so knowing the endpoint URL
@@ -71,9 +72,33 @@ is not enough to empty a cache with an ordinary `GET`.
 | `400` | No `xkey-purge` header on the request |
 | `405` | Not a `PURGE` request |
 
+Every answer says how it was reached. `x-purge-source` is `index` or `scan`,
+and a scan also reports `x-scanned-files`.
+
 Restricting the method is a backstop, not access control. The endpoint still
 authenticates nobody, so put it behind `allow` / `deny` or an internal
 listener.
+
+## The index is an accelerator, not the record
+
+The authoritative copy of an entry's tags is the response header block NGINX
+stores inside the cache file. The shared memory index only makes lookups fast.
+
+So when the index has no answer for a tag, the purge does not report a miss. It
+walks the cache directory, reads each file's stored headers and purges what
+matches. Slow, but always right.
+
+That distinction decides how two otherwise nasty problems behave:
+
+- **A cold index after a restart.** Shared memory does not survive a full stop
+  and start, while the cache on disk does. Purges fall back to scanning until
+  the index warms up again, which it does as entries are served.
+- **Index eviction.** A fixed zone must eventually drop something. Dropping an
+  entry costs a scan, never a wrong answer.
+
+The cost of a scan is one open and one read per cached entry, so it scales with
+how many files the cache zone holds, not with how many match. Turning the
+fallback off trades that cost for purges that can silently miss.
 
 ## Requirements
 
@@ -117,21 +142,18 @@ Both run in CI on every push.
 
 Working: tag recording, purge by tag, shared index across workers, index
 survival across a reload, lazy re-indexing of entries served after a restart,
-`PURGE`-only endpoints, `x-purged-count`.
+the fallback scan, `PURGE`-only endpoints, and reporting which path answered.
 
 Not yet implemented:
 
-- **Index rebuild after a restart.** A full stop and start leaves the cache
-  populated but the tag index empty, because NGINX rebuilds its own index from
-  cache file names without opening them. Entries are re-indexed as they are
-  served, since NGINX replays the stored upstream headers on a hit and the
-  recording filter sees the tag header again, so coverage grows with traffic.
-  What is missing is indexing entries nobody has requested since the restart: a
-  throttled background walk reading each file's stored headers. A reload is
-  unaffected, as the zone mapping is reused and the index survives.
-- **Tombstones.** While a rebuild is in progress a purge can miss entries not yet
-  indexed. Recording purged tags with a timestamp and applying them as the walk
-  discovers entries avoids both a retry protocol and an unbounded queue.
+- **Warming the index from a scan.** A scan already reads every file's tags, so
+  it could repopulate the index on the way past and make the next purge fast.
+  Today the scan answers the request and discards what it learned.
+- **A bound on the index.** Nothing removes a key except purging its tag, so
+  entries for evicted cache files accumulate. Growth is capped by the number of
+  distinct cache keys ever seen, which for per-URL tags is the whole URL space.
+  A full zone currently drops new associations silently. It needs a cap, LRU
+  eviction over tags, and a counter for what it dropped.
 - **Soft purge.** Expiring an entry rather than deleting it, so
   `proxy_cache_use_stale` can keep serving while it revalidates.
 - **Vary variants.** Variants are stored under a different key; all of them share

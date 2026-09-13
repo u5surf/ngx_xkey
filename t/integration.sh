@@ -133,6 +133,11 @@ http {
         location /purge {
             xkey_purge CACHE;
         }
+
+        location /purge-noscan {
+            xkey_purge CACHE;
+            xkey_purge_fallback off;
+        }
     }
 }
 EOF
@@ -166,6 +171,18 @@ purge_count() {
 method_code() {
     curl -sS -m 5 -o /dev/null -w '%{http_code}' -X "$1" \
         -H "xkey-purge: all" "http://127.0.0.1:$PROXY_PORT/purge" 2>/dev/null
+}
+
+# <tag> <header-name>
+purge_header() {
+    curl -sS -m 5 -o /dev/null -D - -X PURGE \
+        -H "xkey-purge: $1" "http://127.0.0.1:$PROXY_PORT/purge" 2>/dev/null \
+        | grep -i "^$2:" | tr -d '\r' | awk '{print $2}'
+}
+
+noscan_code() {
+    curl -sS -m 5 -o /dev/null -w '%{http_code}' -X PURGE \
+        -H "xkey-purge: $1" "http://127.0.0.1:$PROXY_PORT/purge-noscan" 2>/dev/null
 }
 
 cached_files() {
@@ -237,9 +254,18 @@ start_nginx
 
 assert_eq "cache files survive a restart" "2" "$(cached_files)"
 
-# Nothing has been served since the restart, so nothing has been re-recorded.
-assert_eq "KNOWN GAP: the tag index starts empty after a restart" "404" \
-    "$(purge_code all)"
+# Nothing has been served since the restart, so the index holds nothing. The
+# fallback consults the record on disk instead, and still purges correctly.
+assert_eq "a cold index still purges, via the scan" "2" "$(purge_count all)"
+assert_eq "the scan emptied the cache"              "0" "$(cached_files)"
+
+# With the fallback disabled, a cold index answers 404 instead of scanning.
+get_status /a.html >/dev/null
+assert_eq "the entry is cached again" "1" "$(cached_files)"
+stop_nginx
+start_nginx
+assert_eq "fallback off reports a miss on a cold index" "404" "$(noscan_code all)"
+assert_eq "and leaves the entry alone"                  "1"   "$(cached_files)"
 
 # Serving an entry re-records its tags: NGINX stores the upstream response
 # headers in the cache file and replays them on a hit, so the recording
@@ -251,6 +277,27 @@ assert_eq "a served entry is re-indexed"        "1"   "$(purge_count all)"
 # itself is working; only the pre-restart history is missing.
 assert_eq "a post-restart entry is cached" "MISS" "$(get_status /d.html)"
 assert_eq "and can be purged by tag"       "1"    "$(purge_count 'page-/d.html')"
+
+# The response says which path answered, so a miss from a lossy index is not
+# mistaken for a tag that was never cached.
+get_status /c.html >/dev/null
+assert_eq "an index answer says so" "index" "$(purge_header 'page-/c.html' x-purge-source)"
+
+get_status /c.html >/dev/null
+stop_nginx
+start_nginx
+assert_eq "a scan answer says so" "scan" "$(purge_header 'page-/c.html' x-purge-source)"
+
+get_status /c.html >/dev/null
+stop_nginx
+start_nginx
+assert_eq "and reports how many files it read" "1" \
+    "$(purge_header 'page-/c.html' x-scanned-files)"
+
+assert_eq "an unknown tag is still a miss after scanning" "404" "$(purge_code no-such-tag)"
+
+long_tag=$(printf 'a%.0s' $(seq 1 1100))
+assert_eq "an over-long tag is refused" "400" "$(purge_code "$long_tag")"
 
 errors=$(grep -cE '\[(error|crit|alert|emerg)\]' "$PREFIX/logs/error.log" 2>/dev/null || true)
 assert_eq "no errors were logged" "0" "${errors:-0}"

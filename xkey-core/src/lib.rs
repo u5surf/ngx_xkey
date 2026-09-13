@@ -13,6 +13,13 @@ pub const CACHE_KEY_LEN: usize = 16;
 /// A cache entry is addressed by the MD5 of its cache key.
 pub type CacheKey = [u8; CACHE_KEY_LEN];
 
+/// Longest tag accepted on a purge request.
+///
+/// Matches the per-key limit Fastly documents for `Surrogate-Key`, which is a
+/// reasonable ceiling for an opaque label and keeps the tag copyable onto the
+/// stack while a purge runs.
+pub const MAX_TAG_LEN: usize = 1024;
+
 /// Splits a tag header value into individual tags.
 ///
 /// Tags are separated by spaces, tabs or commas, following `xkey`'s
@@ -79,9 +86,160 @@ pub fn format_usize(buf: &mut [u8; 20], mut n: usize) -> &[u8] {
     &buf[i..]
 }
 
+/// Decodes `src` as lowercase or uppercase hex into `dst`.
+///
+/// Returns `false` and leaves `dst` partly written if `src` is not hex or the
+/// lengths do not correspond.  NGINX names each cache file after the hex of
+/// its key, so this is how a path maps back to an entry.
+pub fn hex_decode(src: &[u8], dst: &mut [u8]) -> bool {
+    if src.len() != dst.len() * 2 {
+        return false;
+    }
+
+    for (i, out) in dst.iter_mut().enumerate() {
+        let (hi, lo) = (nibble(src[i * 2]), nibble(src[i * 2 + 1]));
+        match (hi, lo) {
+            (Some(hi), Some(lo)) => *out = (hi << 4) | lo,
+            _ => return false,
+        }
+    }
+
+    true
+}
+
+fn nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Finds a header's value in a raw HTTP response header block.
+///
+/// The block is what NGINX stores in a cache file between `header_start` and
+/// `body_start`: a status line followed by headers, terminated by CRLF or LF.
+/// The match on the name is case-insensitive and the value is trimmed.
+pub fn find_header<'a>(block: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    for line in block.split(|c| *c == b'\n') {
+        let line = trim(line);
+        // The status line has no colon; skip it and anything else malformed.
+        let Some(colon) = line.iter().position(|c| *c == b':') else {
+            continue;
+        };
+        let (found, value) = line.split_at(colon);
+
+        if found.eq_ignore_ascii_case(name) {
+            return Some(trim(&value[1..]));
+        }
+    }
+
+    None
+}
+
+/// Whether a stored header block carries `tag` under the header `name`.
+pub fn block_has_tag(block: &[u8], name: &[u8], tag: &[u8]) -> bool {
+    match find_header(block, name) {
+        Some(value) => split_tags(value).any(|t| t == tag),
+        None => false,
+    }
+}
+
+fn trim(mut s: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = s {
+        if first.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    while let [rest @ .., last] = s {
+        if last.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BLOCK: &[u8] =
+        b"HTTP/1.1 200 OK\r\nServer: origin\r\nXKey: product-1234 all\r\nContent-Length: 4\r\n\r\n";
+
+    #[test]
+    fn decodes_a_cache_file_name() {
+        let mut key = [0u8; CACHE_KEY_LEN];
+        assert!(hex_decode(b"a770dee480525bf34f9a7ba08e552c3d", &mut key));
+        assert_eq!(key[0], 0xa7);
+        assert_eq!(key[CACHE_KEY_LEN - 1], 0x3d);
+    }
+
+    #[test]
+    fn hex_round_trips() {
+        let key: CacheKey = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let mut encoded = [0u8; 32];
+        hex_encode(&key, &mut encoded).unwrap();
+
+        let mut decoded = [0u8; CACHE_KEY_LEN];
+        assert!(hex_decode(&encoded, &mut decoded));
+        assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn hex_decode_accepts_uppercase() {
+        let mut key = [0u8; 2];
+        assert!(hex_decode(b"AbCd", &mut key));
+        assert_eq!(key, [0xab, 0xcd]);
+    }
+
+    #[test]
+    fn hex_decode_rejects_non_hex_and_bad_lengths() {
+        let mut key = [0u8; CACHE_KEY_LEN];
+        assert!(!hex_decode(b"a770dee480525bf34f9a7ba08e552c3g", &mut key));
+        assert!(!hex_decode(b"abcd", &mut key));
+        assert!(!hex_decode(b"", &mut key));
+    }
+
+    #[test]
+    fn finds_a_header_regardless_of_case() {
+        assert_eq!(find_header(BLOCK, b"xkey"), Some(&b"product-1234 all"[..]));
+        assert_eq!(find_header(BLOCK, b"SERVER"), Some(&b"origin"[..]));
+    }
+
+    #[test]
+    fn missing_header_is_none() {
+        assert_eq!(find_header(BLOCK, b"surrogate-key"), None);
+    }
+
+    #[test]
+    fn header_search_tolerates_lf_only_blocks() {
+        let block = b"HTTP/1.1 200 OK\nXKey: a b\n\n";
+        assert_eq!(find_header(block, b"xkey"), Some(&b"a b"[..]));
+    }
+
+    #[test]
+    fn block_tag_match_is_exact_per_tag() {
+        assert!(block_has_tag(BLOCK, b"xkey", b"product-1234"));
+        assert!(block_has_tag(BLOCK, b"xkey", b"all"));
+        // A prefix of a tag must not match the tag.
+        assert!(!block_has_tag(BLOCK, b"xkey", b"product"));
+        // Nor must the whole header value read as one tag.
+        assert!(!block_has_tag(BLOCK, b"xkey", b"product-1234 all"));
+    }
+
+    #[test]
+    fn block_without_the_header_matches_nothing() {
+        let block = b"HTTP/1.1 200 OK\r\nServer: origin\r\n\r\n";
+        assert!(!block_has_tag(block, b"xkey", b"all"));
+    }
 
     fn tags(value: &[u8]) -> Vec<&[u8]> {
         split_tags(value).collect()

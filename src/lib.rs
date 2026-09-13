@@ -34,11 +34,11 @@ use core::ffi::{c_char, c_void};
 use core::ptr::{self, NonNull};
 
 use nginx_sys::{
-    NGX_CONF_TAKE1, NGX_CONF_TAKE2, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET,
-    NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE, NGX_LOG_EMERG, ngx_command_t,
-    ngx_conf_t, ngx_http_conf_ctx_t, ngx_http_file_cache_t, ngx_http_module_t, ngx_http_request_t,
-    ngx_int_t, ngx_module_t, ngx_parse_size, ngx_shared_memory_add, ngx_shm_zone_t, ngx_str_t,
-    ngx_uint_t,
+    NGX_CONF_FLAG, NGX_CONF_TAKE1, NGX_CONF_TAKE2, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET,
+    NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF,
+    NGX_LOG_EMERG, ngx_command_t, ngx_conf_set_flag_slot, ngx_conf_t, ngx_flag_t,
+    ngx_http_conf_ctx_t, ngx_http_file_cache_t, ngx_http_module_t, ngx_http_request_t, ngx_int_t,
+    ngx_module_t, ngx_parse_size, ngx_shared_memory_add, ngx_shm_zone_t, ngx_str_t, ngx_uint_t,
 };
 use ngx::core::{NGX_CONF_ERROR, NGX_CONF_OK, Status};
 use ngx::http::{HttpModule, HttpModuleLocationConf, HttpModuleMainConf, Merge, NgxHttpCoreModule};
@@ -47,6 +47,7 @@ use ngx::{ngx_conf_log_error, ngx_string};
 mod index;
 mod purge;
 mod record;
+mod scan;
 
 use index::Shared;
 
@@ -95,28 +96,42 @@ impl Default for XkeyMainConf {
 
 /// `location`-level configuration: which cache a purge endpoint acts on.
 #[derive(Debug)]
+#[repr(C)]
 pub struct XkeyLocConf {
     /// The `proxy_cache_path` zone named by `xkey_purge`.
     pub cache_zone: *mut ngx_shm_zone_t,
+    /// Whether a tag missing from the index falls back to a directory scan.
+    pub fallback: ngx_flag_t,
 }
 
 impl Default for XkeyLocConf {
     fn default() -> Self {
         Self {
             cache_zone: ptr::null_mut(),
+            fallback: NGX_CONF_UNSET,
         }
     }
 }
 
+/// NGINX's "not configured" marker for a flag slot.
+const NGX_CONF_UNSET: ngx_flag_t = -1;
+
 impl Merge for XkeyLocConf {
-    // A purge endpoint is declared per location and installs a content
-    // handler there; inheriting it into nested locations would be wrong.
-    fn merge(&mut self, _prev: &Self) -> Result<(), ngx::http::MergeConfigError> {
+    // The endpoint itself is not inherited: it is declared per location and
+    // installs a content handler there. Only the fallback setting inherits.
+    fn merge(&mut self, prev: &Self) -> Result<(), ngx::http::MergeConfigError> {
+        if self.fallback == NGX_CONF_UNSET {
+            self.fallback = if prev.fallback == NGX_CONF_UNSET {
+                1
+            } else {
+                prev.fallback
+            };
+        }
         Ok(())
     }
 }
 
-static mut NGX_HTTP_XKEY_COMMANDS: [ngx_command_t; 4] = [
+static mut NGX_HTTP_XKEY_COMMANDS: [ngx_command_t; 5] = [
     ngx_command_t {
         name: ngx_string!("xkey_zone"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1 | NGX_CONF_TAKE2) as ngx_uint_t,
@@ -139,6 +154,15 @@ static mut NGX_HTTP_XKEY_COMMANDS: [ngx_command_t; 4] = [
         set: Some(ngx_http_xkey_purge),
         conf: NGX_HTTP_LOC_CONF_OFFSET,
         offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("xkey_purge_fallback"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG)
+            as ngx_uint_t,
+        set: Some(ngx_conf_set_flag_slot),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: core::mem::offset_of!(XkeyLocConf, fallback),
         post: ptr::null_mut(),
     },
     ngx_command_t::empty(),

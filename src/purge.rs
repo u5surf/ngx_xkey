@@ -13,11 +13,11 @@ use nginx_sys::{
     ngx_http_request_t, ngx_int_t, ngx_shmtx_lock, ngx_shmtx_unlock,
 };
 use ngx::core::Status;
-use ngx::http::{HTTPStatus, HttpModuleLocationConf, Request};
+use ngx::http::{HTTPStatus, HttpModuleLocationConf, HttpModuleMainConf, Request};
 
-use xkey_core::{format_usize, hex_encode, node_key, node_key_rest};
+use xkey_core::{MAX_TAG_LEN, format_usize, hex_encode, node_key, node_key_rest};
 
-use crate::{CACHE_KEY_LEN, CacheKey, HttpXkeyModule, index};
+use crate::{CACHE_KEY_LEN, CacheKey, HttpXkeyModule, index, scan};
 
 /// Request header naming the tag to purge.
 const PURGE_HEADER: &[u8] = b"xkey-purge";
@@ -42,9 +42,18 @@ pub unsafe extern "C" fn handler(r: *mut ngx_http_request_t) -> ngx_int_t {
         return rc.into();
     }
 
-    let Some(tag) = purge_tag(request) else {
+    // Copied out of the request so the tag does not keep it borrowed for the
+    // rest of the purge. Over-long tags are refused rather than truncated.
+    let mut buf = [0u8; MAX_TAG_LEN];
+    let Some(tag_len) = purge_tag(request).and_then(|tag| {
+        (tag.len() <= MAX_TAG_LEN).then(|| {
+            buf[..tag.len()].copy_from_slice(tag);
+            tag.len()
+        })
+    }) else {
         return HTTPStatus::BAD_REQUEST.into();
     };
+    let tag = &buf[..tag_len];
 
     let Some(xlcf) = HttpXkeyModule::location_conf(request.as_ref()) else {
         return Status::NGX_ERROR.into();
@@ -65,24 +74,83 @@ pub unsafe extern "C" fn handler(r: *mut ngx_http_request_t) -> ngx_int_t {
     };
 
     let Some(keys) = keys else {
-        return HTTPStatus::NOT_FOUND.into();
+        return fall_back(request, cache.as_ptr(), tag);
     };
 
     let mut purged = 0usize;
     for key in keys.iter() {
-        if unsafe { invalidate(cache.as_mut(), key) } {
+        let cleared = unsafe { invalidate(cache.as_mut(), key) };
+        let unlinked = unsafe { delete_file(request, cache.as_mut(), key) };
+
+        if cleared || unlinked {
             purged += 1;
         }
-        unsafe { delete_file(request, cache.as_mut(), key) };
     }
 
-    let mut count = [0u8; 20];
-    let count = format_usize(&mut count, purged);
-    if let Ok(value) = core::str::from_utf8(count) {
+    report(request, "index", purged, None);
+    no_content(request)
+}
+
+/// Answers from the cache directory when the index has nothing for the tag.
+///
+/// The index can be cold after a restart, or have dropped the tag under
+/// pressure. Neither is distinguishable from a tag that was never cached, so
+/// the only honest answer is to consult the record on disk.
+fn fall_back(request: &mut Request, cache: *mut ngx_http_file_cache_t, tag: &[u8]) -> ngx_int_t {
+    let Some(xmcf) = HttpXkeyModule::main_conf_mut(request.as_ref()) else {
+        return Status::NGX_ERROR.into();
+    };
+    let Some(xlcf) = HttpXkeyModule::location_conf(request.as_ref()) else {
+        return Status::NGX_ERROR.into();
+    };
+
+    if xlcf.fallback == 0 {
+        return HTTPStatus::NOT_FOUND.into();
+    }
+
+    let buf = request.pool().alloc_unaligned(scan::MAX_HEADER_BLOCK);
+    if buf.is_null() {
+        return Status::NGX_ERROR.into();
+    }
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf.cast::<u8>(), scan::MAX_HEADER_BLOCK) };
+
+    let mut s = scan::Scan {
+        tag,
+        header: xmcf.header.as_bytes(),
+        cache,
+        buf,
+        scanned: 0,
+        purged: 0,
+    };
+
+    if scan::run(&mut s, request.log()) == Status::NGX_ERROR {
+        return Status::NGX_ERROR.into();
+    }
+
+    if s.purged == 0 {
+        report(request, "scan", 0, Some(s.scanned));
+        return HTTPStatus::NOT_FOUND.into();
+    }
+
+    report(request, "scan", s.purged, Some(s.scanned));
+    no_content(request)
+}
+
+/// Reports what the purge did and how it found out.
+fn report(request: &mut Request, source: &str, purged: usize, scanned: Option<usize>) {
+    let mut buf = [0u8; 20];
+
+    request.add_header_out("x-purge-source", source);
+
+    if let Ok(value) = core::str::from_utf8(format_usize(&mut buf, purged)) {
         request.add_header_out("x-purged-count", value);
     }
 
-    no_content(request)
+    if let Some(scanned) = scanned
+        && let Ok(value) = core::str::from_utf8(format_usize(&mut buf, scanned))
+    {
+        request.add_header_out("x-scanned-files", value);
+    }
 }
 
 /// Whether the request uses the PURGE method.
@@ -109,7 +177,7 @@ fn purge_tag(request: &Request) -> Option<&[u8]> {
 /// 16-byte key: the node key is the leading `sizeof(ngx_rbtree_key_t)` bytes
 /// copied verbatim, in native byte order, with the remainder held in the
 /// node's own `key` field and compared bytewise on a tie.
-unsafe fn invalidate(cache: &mut ngx_http_file_cache_t, key: &CacheKey) -> bool {
+pub(crate) unsafe fn invalidate(cache: &mut ngx_http_file_cache_t, key: &CacheKey) -> bool {
     let node_key = node_key(key);
     let rest = node_key_rest(key);
 
@@ -157,16 +225,19 @@ unsafe fn invalidate(cache: &mut ngx_http_file_cache_t, key: &CacheKey) -> bool 
 }
 
 /// Unlinks the cache file backing `key`.
-unsafe fn delete_file(request: &mut Request, cache: &mut ngx_http_file_cache_t, key: &CacheKey) {
-    let path = match unsafe { cache.path.as_mut() } {
-        Some(p) => p,
-        None => return,
+unsafe fn delete_file(
+    request: &mut Request,
+    cache: &mut ngx_http_file_cache_t,
+    key: &CacheKey,
+) -> bool {
+    let Some(path) = (unsafe { cache.path.as_mut() }) else {
+        return false;
     };
 
     let len = path.name.len + 1 + path.len + 2 * CACHE_KEY_LEN;
     let name = request.pool().alloc_unaligned(len + 1);
     if name.is_null() {
-        return;
+        return false;
     }
     let name = name.cast::<u8>();
 
@@ -182,7 +253,7 @@ unsafe fn delete_file(request: &mut Request, cache: &mut ngx_http_file_cache_t, 
 
         ngx_create_hashed_filename(path, name, len);
 
-        libc::unlink(name.cast::<c_char>());
+        libc::unlink(name.cast::<c_char>()) == 0
     }
 }
 
