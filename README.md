@@ -60,12 +60,20 @@ x-purged-count: 3
 | `xkey_header <name>` | `http` | Response header listing tags, default `xkey` |
 | `xkey_purge <cache_zone>` | `location` | Turn this location into a purge endpoint for the named `proxy_cache_path` zone |
 
-Responses: `204` when the tag was found, with `x-purged-count` naming how many
-live entries were invalidated; `404` when the tag is unknown; `400` when the
-request carries no `xkey-purge` header.
+A purge endpoint answers the `PURGE` method only. Every other method gets
+`405` with an `Allow` header and touches nothing, so knowing the endpoint URL
+is not enough to empty a cache with an ordinary `GET`.
 
-The purge endpoint has no access control of its own. Put it behind `allow` /
-`deny` or an internal listener.
+| Response | Meaning |
+|---|---|
+| `204` | Tag found. `x-purged-count` names how many live entries were invalidated |
+| `404` | The tag is not in the index |
+| `400` | No `xkey-purge` header on the request |
+| `405` | Not a `PURGE` request |
+
+Restricting the method is a backstop, not access control. The endpoint still
+authenticates nobody, so put it behind `allow` / `deny` or an internal
+listener.
 
 ## Requirements
 
@@ -109,7 +117,7 @@ Both run in CI on every push.
 
 Working: tag recording, purge by tag, shared index across workers, index
 survival across a reload, lazy re-indexing of entries served after a restart,
-`204` / `404` / `400` responses, `x-purged-count`.
+`PURGE`-only endpoints, `x-purged-count`.
 
 Not yet implemented:
 

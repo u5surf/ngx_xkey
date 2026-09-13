@@ -22,9 +22,20 @@ use crate::{CACHE_KEY_LEN, CacheKey, HttpXkeyModule, index};
 /// Request header naming the tag to purge.
 const PURGE_HEADER: &[u8] = b"xkey-purge";
 
+/// The only method a purge endpoint answers.
+///
+/// NGINX does not know `PURGE`, so it parses as an unknown method and the
+/// literal is kept in `method_name`.
+const PURGE_METHOD: &[u8] = b"PURGE";
+
 /// Content handler installed by `xkey_purge`.
 pub unsafe extern "C" fn handler(r: *mut ngx_http_request_t) -> ngx_int_t {
     let request = unsafe { Request::from_ngx_http_request(r) };
+
+    if !is_purge(request) {
+        request.add_header_out("allow", "PURGE");
+        return HTTPStatus::NOT_ALLOWED.into();
+    }
 
     let rc = request.discard_request_body();
     if rc != Status::NGX_OK {
@@ -72,6 +83,11 @@ pub unsafe extern "C" fn handler(r: *mut ngx_http_request_t) -> ngx_int_t {
     }
 
     no_content(request)
+}
+
+/// Whether the request uses the PURGE method.
+fn is_purge(request: &Request) -> bool {
+    request.as_ref().method_name.as_bytes() == PURGE_METHOD
 }
 
 /// The tag named by the request, if any.

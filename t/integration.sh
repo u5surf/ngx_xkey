@@ -152,14 +152,20 @@ get_status() {
 }
 
 purge_code() {
-    curl -sS -m 5 -o /dev/null -w '%{http_code}' \
+    curl -sS -m 5 -o /dev/null -w '%{http_code}' -X PURGE \
         -H "xkey-purge: $1" "http://127.0.0.1:$PROXY_PORT/purge" 2>/dev/null
 }
 
 purge_count() {
-    curl -sS -m 5 -o /dev/null -D - \
+    curl -sS -m 5 -o /dev/null -D - -X PURGE \
         -H "xkey-purge: $1" "http://127.0.0.1:$PROXY_PORT/purge" 2>/dev/null \
         | grep -i '^x-purged-count:' | tr -d '\r' | awk '{print $2}'
+}
+
+# <method>
+method_code() {
+    curl -sS -m 5 -o /dev/null -w '%{http_code}' -X "$1" \
+        -H "xkey-purge: all" "http://127.0.0.1:$PROXY_PORT/purge" 2>/dev/null
 }
 
 cached_files() {
@@ -189,8 +195,25 @@ assert_eq "re-purging a consumed tag is a miss" "404" "$(purge_code all)"
 assert_eq "an unknown tag is a miss"            "404" "$(purge_code no-such-tag)"
 
 assert_eq "a request with no tag header is rejected" "400" \
-    "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' \
+    "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X PURGE \
         "http://127.0.0.1:$PROXY_PORT/purge" 2>/dev/null)"
+
+# Only PURGE reaches the purge logic.  A GET must not be able to empty a
+# cache just by knowing the endpoint URL.
+assert_eq "GET is rejected"    "405" "$(method_code GET)"
+assert_eq "POST is rejected"   "405" "$(method_code POST)"
+assert_eq "HEAD is rejected"   "405" "$(method_code HEAD)"
+assert_eq "DELETE is rejected" "405" "$(method_code DELETE)"
+
+assert_eq "the rejection advertises the allowed method" "PURGE" \
+    "$(curl -sS -m 5 -o /dev/null -D - -X GET \
+        "http://127.0.0.1:$PROXY_PORT/purge" 2>/dev/null \
+        | grep -i '^allow:' | tr -d '\r' | awk '{print $2}')"
+
+# A rejected GET must leave the cache untouched.
+get_status /a.html >/dev/null
+assert_eq "a rejected GET purges nothing" "1" "$(cached_files)"
+assert_eq "and the entry is still purgeable" "1" "$(purge_count 'page-/a.html')"
 
 # The tag index lives in a zone NGINX reuses across a reload, so associations
 # recorded before the reload must still resolve afterwards.
