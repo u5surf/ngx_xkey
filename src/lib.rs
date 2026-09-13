@@ -50,11 +50,10 @@ mod record;
 
 use index::Shared;
 
-/// Length of an NGINX cache key: the MD5 of the cache key string.
-pub const CACHE_KEY_LEN: usize = nginx_sys::NGX_HTTP_CACHE_KEY_LEN as usize;
+pub use xkey_core::{CACHE_KEY_LEN, CacheKey};
 
-/// A cache entry is addressed by the MD5 of its cache key.
-pub type CacheKey = [u8; CACHE_KEY_LEN];
+// The layout xkey-core assumes must be the one NGINX actually uses.
+const _: () = assert!(CACHE_KEY_LEN == nginx_sys::NGX_HTTP_CACHE_KEY_LEN as usize);
 
 struct HttpXkeyModule;
 

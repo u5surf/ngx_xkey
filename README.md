@@ -86,10 +86,21 @@ Rust toolchain is required at nginx configure time. ngx-rust is pulled from git
 at a pinned revision, because nginx 1.30 support is not in a published release
 yet.
 
+## Tests
+
+```console
+$ cargo test -p xkey-core      # unit tests, no NGINX needed
+$ t/integration.sh             # builds NGINX with the module and exercises it
+```
+
+The integration script fetches an NGINX release, builds it with the module,
+and runs a real cache through record, purge, reload and error-path scenarios.
+Both run in CI on every push.
+
 ## Status
 
-Working: tag recording, purge by tag, shared index across workers, `204` /
-`404` / `400` responses, `x-purged-count`.
+Working: tag recording, purge by tag, shared index across workers, index
+survival across a reload, `204` / `404` / `400` responses, `x-purged-count`.
 
 Not yet implemented:
 

@@ -1,0 +1,8 @@
+[package]
+name = "xkey-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+description = "Pure logic behind ngx_xkey, kept free of NGINX symbols so it can be unit tested"
+license = "MIT OR Apache-2.0"
+publish = false

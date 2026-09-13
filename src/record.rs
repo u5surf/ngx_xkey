@@ -74,10 +74,7 @@ fn record(request: &mut Request) {
     };
 
     let mut index = shared.write();
-    for tag in tags.split(|c| matches!(c, b' ' | b'\t' | b',')) {
-        if tag.is_empty() {
-            continue;
-        }
+    for tag in xkey_core::split_tags(tags) {
         if index::insert(&mut index, &alloc, tag, &key).is_err() {
             // The zone is full.  Dropping the association is the honest
             // outcome: a later purge for this tag will miss the entry.

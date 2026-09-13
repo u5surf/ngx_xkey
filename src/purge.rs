@@ -7,14 +7,15 @@
 
 use core::cmp::Ordering;
 use core::ffi::c_char;
-use core::mem;
 
 use nginx_sys::{
-    ngx_create_hashed_filename, ngx_hex_dump, ngx_http_file_cache_node_t, ngx_http_file_cache_t,
-    ngx_http_request_t, ngx_int_t, ngx_rbtree_key_t, ngx_shmtx_lock, ngx_shmtx_unlock,
+    ngx_create_hashed_filename, ngx_http_file_cache_node_t, ngx_http_file_cache_t,
+    ngx_http_request_t, ngx_int_t, ngx_shmtx_lock, ngx_shmtx_unlock,
 };
 use ngx::core::Status;
 use ngx::http::{HTTPStatus, HttpModuleLocationConf, Request};
+
+use xkey_core::{format_usize, hex_encode, node_key, node_key_rest};
 
 use crate::{CACHE_KEY_LEN, CacheKey, HttpXkeyModule, index};
 
@@ -93,11 +94,8 @@ fn purge_tag(request: &Request) -> Option<&[u8]> {
 /// copied verbatim, in native byte order, with the remainder held in the
 /// node's own `key` field and compared bytewise on a tie.
 unsafe fn invalidate(cache: &mut ngx_http_file_cache_t, key: &CacheKey) -> bool {
-    const PREFIX: usize = mem::size_of::<ngx_rbtree_key_t>();
-
-    let node_key =
-        ngx_rbtree_key_t::from_ne_bytes(key[..PREFIX].try_into().expect("rbtree key prefix"));
-    let rest = &key[PREFIX..];
+    let node_key = node_key(key);
+    let rest = node_key_rest(key);
 
     let shpool = cache.shpool;
     unsafe { ngx_shmtx_lock(&raw mut (*shpool).mutex) };
@@ -159,9 +157,12 @@ unsafe fn delete_file(request: &mut Request, cache: &mut ngx_http_file_cache_t, 
     unsafe {
         core::ptr::copy_nonoverlapping(path.name.data, name, path.name.len);
 
-        let p = name.add(path.name.len + 1 + path.len);
-        let p = ngx_hex_dump(p, key.as_ptr().cast_mut(), CACHE_KEY_LEN);
-        *p = 0;
+        let hex = core::slice::from_raw_parts_mut(
+            name.add(path.name.len + 1 + path.len),
+            2 * CACHE_KEY_LEN,
+        );
+        hex_encode(key, hex).expect("hex buffer sized above");
+        *name.add(len) = 0;
 
         ngx_create_hashed_filename(path, name, len);
 
@@ -181,18 +182,4 @@ fn no_content(request: &mut Request) -> ngx_int_t {
     }
 
     Status::NGX_OK.into()
-}
-
-/// Formats `n` into `buf`, returning the populated slice.
-fn format_usize(buf: &mut [u8; 20], mut n: usize) -> &[u8] {
-    let mut i = buf.len();
-    loop {
-        i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
-    }
-    &buf[i..]
 }

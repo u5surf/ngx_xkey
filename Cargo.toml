@@ -1,3 +1,6 @@
+[workspace]
+members = ["xkey-core"]
+
 [package]
 name = "ngx_xkey"
 version = "0.1.0"
@@ -18,6 +21,7 @@ crate-type = ["cdylib"]
 ngx = { git = "https://github.com/nginx/ngx-rust", rev = "cda9d8372ccd2e139ef2b03e5806e019e7796187", default-features = false, features = ["std"] }
 nginx-sys = { git = "https://github.com/nginx/ngx-rust", rev = "cda9d8372ccd2e139ef2b03e5806e019e7796187" }
 libc = "0.2"
+xkey-core = { path = "xkey-core" }
 
 [features]
 default = ["export-modules", "ngx/vendored"]

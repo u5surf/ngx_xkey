@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # Only the core crate is linted here. The module crate links against
+      # NGINX, so it is compiled by the integration job instead.
+      - name: Clippy
+        run: cargo clippy -p xkey-core --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test -p xkey-core
+
+  integration:
+    name: integration tests (nginx ${{ matrix.nginx }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.30 is the minimum: it is the first release exposing the proxy
+        # module's configuration through a public header.
+        nginx: ["1.30.4"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache nginx source
+        uses: actions/cache@v4
+        with:
+          path: target/integration/nginx-${{ matrix.nginx }}
+          key: nginx-src-${{ matrix.nginx }}
+
+      - name: Run integration tests
+        run: t/integration.sh ${{ matrix.nginx }}
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nginx-logs-${{ matrix.nginx }}
+          path: |
+            target/integration/configure.log
+            target/integration/make.log
+            target/integration/inst/logs/
+          if-no-files-found: ignore
+          retention-days: 7
