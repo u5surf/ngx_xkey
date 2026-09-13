@@ -16,8 +16,7 @@ path = "src/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Pinned rather than tracking a branch: nginx 1.30 support, which this module
-# requires, landed in this commit and is not in a published release yet.
+# Pinned rather than tracking a branch, so that builds are reproducible.
 ngx = { git = "https://github.com/nginx/ngx-rust", rev = "cda9d8372ccd2e139ef2b03e5806e019e7796187", default-features = false, features = ["std"] }
 nginx-sys = { git = "https://github.com/nginx/ngx-rust", rev = "cda9d8372ccd2e139ef2b03e5806e019e7796187" }
 libc = "0.2"

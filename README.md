@@ -69,9 +69,18 @@ The purge endpoint has no access control of its own. Put it behind `allow` /
 
 ## Requirements
 
-nginx 1.30 or newer. The module reads the proxy module's shared-zone tag, and
-1.30 is the first release to expose the proxy module's configuration through a
-public header, which lets bindgen derive the layout instead of hand-copying it.
+Tested against these NGINX releases, all passing the full integration suite:
+
+| 1.18.0 | 1.20.2 | 1.22.1 | 1.24.0 | 1.26.3 | 1.28.0 | 1.30.4 |
+|---|---|---|---|---|---|---|
+
+The module reads NGINX's file cache structures through bindings generated from
+the headers of whatever release it is built against, so nothing about the
+layout is hard-coded. It touches no private structure of the proxy module; the
+only thing it borrows from there is the module symbol, used as the tag when
+looking up a `proxy_cache_path` zone by name.
+
+Older releases may work but are not covered by CI.
 
 ## Building
 
@@ -83,8 +92,7 @@ $ make && make install
 
 The module is built by cargo through ngx-rust's `auto/rust` integration, so a
 Rust toolchain is required at nginx configure time. ngx-rust is pulled from git
-at a pinned revision, because nginx 1.30 support is not in a published release
-yet.
+at a pinned revision so that builds are reproducible.
 
 ## Tests
 
