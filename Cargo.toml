@@ -1,0 +1,34 @@
+[package]
+name = "ngx_xkey"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+description = "Surrogate-key (tag) based cache purging for nginx, in the spirit of Varnish xkey"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "xkey"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+ngx = { path = "../ngx-rust", default-features = false, features = ["std"] }
+nginx-sys = { path = "../ngx-rust/nginx-sys" }
+libc = "0.2"
+
+[features]
+default = ["export-modules", "ngx/vendored"]
+# Required to build a loadable cdylib outside of the NGINX buildsystem.
+export-modules = []
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Profiles used by the NGINX buildsystem integration in auto/rust.
+[profile.ngx-debug]
+inherits = "dev"
+
+[profile.ngx-release]
+inherits = "release"

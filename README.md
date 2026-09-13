@@ -1,0 +1,110 @@
+# ngx_xkey
+
+Surrogate-key (tag) based cache purging for NGINX, in the spirit of Varnish's
+`vmod_xkey`. Written in Rust on top of [ngx-rust].
+
+NGINX has no tag-based invalidation. The usual workaround is to encode the
+varying dimensions into the cache key and purge with a trailing wildcard, which
+walks the whole cache directory and reads every file's header. This module keeps
+a tag index in shared memory instead, so a purge costs one lookup plus the
+matching entries.
+
+## How it works
+
+An upstream response declares its tags in a header:
+
+```http
+xkey: product-1234 category-shoes
+```
+
+A header filter records, for every response on its way into the cache, the
+association from each tag to that entry's 16-byte cache key. A purge request
+naming a tag takes the whole set, clears each node's accounting in the cache
+zone and unlinks the file.
+
+The index lives in its own shared memory zone rather than borrowing the cache
+zone's slab, so `keys_zone` sizing stays meaningful and an exhausted tag index
+cannot starve the cache itself.
+
+## Configuration
+
+```nginx
+load_module modules/ngx_http_xkey_module.so;
+
+http {
+    proxy_cache_path /var/cache/nginx keys_zone=CACHE:100m levels=1:2;
+    xkey_zone xkey:32m;
+
+    server {
+        location / {
+            proxy_pass  http://backend;
+            proxy_cache CACHE;
+        }
+
+        location /purge {
+            xkey_purge CACHE;
+        }
+    }
+}
+```
+
+```console
+$ curl -X PURGE -H 'xkey-purge: product-1234' http://localhost/purge
+HTTP/1.1 204 No Content
+x-purged-count: 3
+```
+
+| Directive | Context | Meaning |
+|---|---|---|
+| `xkey_zone <name>:<size>` | `http` | Shared memory zone holding the tag index |
+| `xkey_header <name>` | `http` | Response header listing tags, default `xkey` |
+| `xkey_purge <cache_zone>` | `location` | Turn this location into a purge endpoint for the named `proxy_cache_path` zone |
+
+Responses: `204` when the tag was found, with `x-purged-count` naming how many
+live entries were invalidated; `404` when the tag is unknown; `400` when the
+request carries no `xkey-purge` header.
+
+The purge endpoint has no access control of its own. Put it behind `allow` /
+`deny` or an internal listener.
+
+## Requirements
+
+nginx 1.30 or newer. The module reads the proxy module's shared-zone tag, and
+1.30 is the first release to expose the proxy module's configuration through a
+public header, which lets bindgen derive the layout instead of hand-copying it.
+
+## Building
+
+```console
+$ cd nginx-source
+$ auto/configure --with-compat --add-dynamic-module=/path/to/ngx_xkey
+$ make && make install
+```
+
+The module is built by cargo through ngx-rust's `auto/rust` integration, so a
+Rust toolchain is required at nginx configure time.
+
+## Status
+
+Working: tag recording, purge by tag, shared index across workers, `204` /
+`404` / `400` responses, `x-purged-count`.
+
+Not yet implemented:
+
+- **Index rebuild after a restart.** NGINX's cache loader rebuilds its own index
+  from cache file names without opening the files, so after a full stop and
+  start the cache is populated but the tag index is empty. A reload is fine: the
+  zone mapping is reused and the index survives. The plan is a throttled
+  background walk that reads each file's stored headers, plus lazy population on
+  cache hits.
+- **Tombstones.** While a rebuild is in progress a purge can miss entries not yet
+  indexed. Recording purged tags with a timestamp and applying them as the walk
+  discovers entries avoids both a retry protocol and an unbounded queue.
+- **Soft purge.** Expiring an entry rather than deleting it, so
+  `proxy_cache_use_stale` can keep serving while it revalidates.
+- **Vary variants.** Variants are stored under a different key; all of them share
+  the same stored cache key string, which is what links them.
+- **Zone exhaustion policy.** A full tag index currently drops the association
+  silently.
+
+[ngx-rust]: https://github.com/nginx/ngx-rust
