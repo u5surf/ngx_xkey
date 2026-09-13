@@ -100,16 +100,19 @@ Both run in CI on every push.
 ## Status
 
 Working: tag recording, purge by tag, shared index across workers, index
-survival across a reload, `204` / `404` / `400` responses, `x-purged-count`.
+survival across a reload, lazy re-indexing of entries served after a restart,
+`204` / `404` / `400` responses, `x-purged-count`.
 
 Not yet implemented:
 
-- **Index rebuild after a restart.** NGINX's cache loader rebuilds its own index
-  from cache file names without opening the files, so after a full stop and
-  start the cache is populated but the tag index is empty. A reload is fine: the
-  zone mapping is reused and the index survives. The plan is a throttled
-  background walk that reads each file's stored headers, plus lazy population on
-  cache hits.
+- **Index rebuild after a restart.** A full stop and start leaves the cache
+  populated but the tag index empty, because NGINX rebuilds its own index from
+  cache file names without opening them. Entries are re-indexed as they are
+  served, since NGINX replays the stored upstream headers on a hit and the
+  recording filter sees the tag header again, so coverage grows with traffic.
+  What is missing is indexing entries nobody has requested since the restart: a
+  throttled background walk reading each file's stored headers. A reload is
+  unaffected, as the zone mapping is reused and the index survives.
 - **Tombstones.** While a rebuild is in progress a purge can miss entries not yet
   indexed. Recording purged tags with a timestamp and applying them as the walk
   discovers entries avoids both a retry protocol and an unbounded queue.

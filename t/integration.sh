@@ -52,6 +52,11 @@ stop_nginx() {
     fi
 }
 
+start_nginx() {
+    "$PREFIX/sbin/nginx" -p "$PREFIX"
+    sleep 1
+}
+
 trap stop_nginx EXIT INT TERM
 
 # --------------------------------------------------------------------------
@@ -90,6 +95,7 @@ mkdir -p "$CACHE" "$PREFIX/origin" "$PREFIX/logs"
 echo one   > "$PREFIX/origin/a.html"
 echo two   > "$PREFIX/origin/b.html"
 echo three > "$PREFIX/origin/c.html"
+echo four  > "$PREFIX/origin/d.html"
 
 cat > "$PREFIX/conf/nginx.conf" <<EOF
 load_module modules/ngx_http_xkey_module.so;
@@ -135,8 +141,7 @@ EOF
     || { "$PREFIX/sbin/nginx" -p "$PREFIX" -t; exit 1; }
 
 say "==> running"
-"$PREFIX/sbin/nginx" -p "$PREFIX"
-sleep 1
+start_nginx
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -195,6 +200,34 @@ get_status /b.html >/dev/null
 sleep 2
 assert_eq "the index survives a reload" "2" "$(purge_count all)"
 assert_eq "reload-purged files are gone" "0" "$(cached_files)"
+
+# A full restart drops the shared memory holding the tag index, while NGINX
+# rebuilds its own cache index from cache file names without opening them.
+# The cache therefore survives but the tag index does not.  These assertions
+# document that gap; they are what changes when the background rebuild lands.
+get_status /a.html >/dev/null
+get_status /b.html >/dev/null
+assert_eq "two entries cached before the restart" "2" "$(cached_files)"
+
+stop_nginx
+start_nginx
+
+assert_eq "cache files survive a restart" "2" "$(cached_files)"
+
+# Nothing has been served since the restart, so nothing has been re-recorded.
+assert_eq "KNOWN GAP: the tag index starts empty after a restart" "404" \
+    "$(purge_code all)"
+
+# Serving an entry re-records its tags: NGINX stores the upstream response
+# headers in the cache file and replays them on a hit, so the recording
+# filter sees the tag header again without any upstream traffic.
+assert_eq "NGINX still serves the cached entry" "HIT" "$(get_status /a.html)"
+assert_eq "a served entry is re-indexed"        "1"   "$(purge_count all)"
+
+# Entries recorded after the restart are purgeable as usual, so the module
+# itself is working; only the pre-restart history is missing.
+assert_eq "a post-restart entry is cached" "MISS" "$(get_status /d.html)"
+assert_eq "and can be purged by tag"       "1"    "$(purge_count 'page-/d.html')"
 
 errors=$(grep -cE '\[(error|crit|alert|emerg)\]' "$PREFIX/logs/error.log" 2>/dev/null || true)
 assert_eq "no errors were logged" "0" "${errors:-0}"
