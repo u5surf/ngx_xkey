@@ -1,0 +1,17 @@
+ngx_xkey
+Copyright 2026 Y.Horie
+
+Licensed under either of Apache License, Version 2.0 or MIT license at your
+option.
+
+--------------------------------------------------------------------------
+
+This product includes software developed at F5, Inc.
+
+  auto/rust
+
+is copied verbatim from the ngx-rust project
+(https://github.com/nginx/ngx-rust), Copyright 2025 Nginx, Inc., and is
+licensed under the Apache License, Version 2.0. Its original license header
+is retained in the file. A copy of the Apache License is included as
+LICENSE-APACHE.

@@ -82,7 +82,9 @@ $ make && make install
 ```
 
 The module is built by cargo through ngx-rust's `auto/rust` integration, so a
-Rust toolchain is required at nginx configure time.
+Rust toolchain is required at nginx configure time. ngx-rust is pulled from git
+at a pinned revision, because nginx 1.30 support is not in a published release
+yet.
 
 ## Status
 
@@ -108,3 +110,11 @@ Not yet implemented:
   silently.
 
 [ngx-rust]: https://github.com/nginx/ngx-rust
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
+
+`auto/rust` is copied verbatim from [ngx-rust] and remains under the Apache
+License, Version 2.0. See [NOTICE](NOTICE).
