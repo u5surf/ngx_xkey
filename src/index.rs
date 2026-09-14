@@ -59,6 +59,10 @@ pub struct TagIndex {
     /// Most recently used first. Self-referential, so it can only be
     /// initialised once the index sits at its final address.
     lru: ngx_queue_t,
+    /// Tags currently held.
+    pub tags: usize,
+    /// Cache keys currently held, summed over every tag.
+    pub keys: usize,
     /// Tags dropped to make room.
     pub evicted: u64,
     /// Keys dropped because a tag reached [`MAX_KEYS_PER_TAG`].
@@ -117,6 +121,8 @@ impl TagIndex {
 
         let mut dropped = 0;
 
+        let mut added = 0;
+
         if !entry.keys.contains(key) {
             if entry.keys.len() >= MAX_KEYS_PER_TAG {
                 entry.keys.remove(0);
@@ -124,9 +130,11 @@ impl TagIndex {
             }
             entry.keys.try_reserve(1).map_err(|_| AllocError)?;
             entry.keys.push(*key);
+            added = 1;
         }
 
         self.dropped += dropped;
+        self.keys += added - dropped as usize;
 
         Ok(())
     }
@@ -153,6 +161,9 @@ impl TagIndex {
         unsafe {
             ngx_queue_insert_after(&raw mut self.lru, link);
         }
+
+        self.tags += 1;
+        self.keys += 1;
 
         Ok(())
     }
@@ -192,7 +203,9 @@ impl TagIndex {
         // Unlink before the map drops the entry and with it the link.
         unsafe { ngx_queue_remove(last) };
 
-        if self.map.remove(&name[..len]).is_some() {
+        if let Some(entry) = self.map.remove(&name[..len]) {
+            self.tags -= 1;
+            self.keys -= entry.keys.len();
             self.evicted += 1;
             return true;
         }
@@ -205,7 +218,12 @@ impl TagIndex {
         let entry = self.map.get_mut(tag)?;
         unsafe { ngx_queue_remove(&raw mut entry.lru) };
 
-        self.map.remove(tag).map(|entry| entry.keys)
+        let keys = self.map.remove(tag).map(|entry| entry.keys)?;
+
+        self.tags -= 1;
+        self.keys -= keys.len();
+
+        Some(keys)
     }
 }
 
@@ -222,6 +240,8 @@ pub fn shared(shm_zone: &mut ngx_shm_zone_t) -> Result<&'static Shared, Status> 
         let index = TagIndex {
             map,
             lru: unsafe { mem::zeroed() },
+            tags: 0,
+            keys: 0,
             evicted: 0,
             dropped: 0,
         };

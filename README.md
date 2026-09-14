@@ -60,6 +60,7 @@ x-purged-count: 3
 | `xkey_header <name>` | `http` | Response header listing tags, default `xkey` |
 | `xkey_purge <cache_zone>` | `location` | Turn this location into a purge endpoint for the named `proxy_cache_path` zone |
 | `xkey_purge_fallback on\|off` | `http`, `server`, `location` | Whether a tag missing from the index falls back to a directory scan. Default `on` |
+| `xkey_status` | `location` | Turn this location into a JSON status endpoint |
 
 A purge endpoint answers the `PURGE` method only. Every other method gets
 `405` with an `Allow` header and touches nothing, so knowing the endpoint URL
@@ -80,6 +81,26 @@ zone that is too small for its traffic says so instead of degrading quietly.
 Restricting the method is a backstop, not access control. The endpoint still
 authenticates nobody, so put it behind `allow` / `deny` or an internal
 listener.
+
+## Status
+
+```console
+$ curl http://localhost/status
+{"configured":true,
+ "zone":{"size":33554432,"pages_total":2047,"pages_free":1902},
+ "index":{"tags":184,"keys":1290,"evictions":0,"key_drops":0,
+          "max_keys_per_tag":65536}}
+```
+
+`pages_free` against `pages_total` is what says whether the zone is big
+enough. A non-zero `evictions` means it is not: purges still work, because the
+scan is authoritative, but the ones that lost their tag now pay for a walk of
+the whole cache directory. `key_drops` counts keys shed by a tag that hit
+`max_keys_per_tag`, which usually means a tag is being used as a per-URL label
+rather than to name a group.
+
+The endpoint answers `GET` and `HEAD`. Like the purge endpoint it authenticates
+nobody, so keep it internal.
 
 ## The index is an accelerator, not the record
 
@@ -154,7 +175,8 @@ Both run in CI on every push.
 Working: tag recording, purge by tag, shared index across workers, index
 survival across a reload, lazy re-indexing of entries served after a restart,
 the fallback scan and the index warming it performs, LRU eviction under zone
-pressure, `PURGE`-only endpoints, and reporting which path answered.
+pressure, a JSON status endpoint, `PURGE`-only endpoints, and reporting which
+path answered.
 
 Not yet implemented:
 

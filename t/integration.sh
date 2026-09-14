@@ -136,6 +136,10 @@ http {
             xkey_purge CACHE;
         }
 
+        location /status {
+            xkey_status;
+        }
+
         location /purge-noscan {
             xkey_purge CACHE;
             xkey_purge_fallback off;
@@ -196,6 +200,12 @@ hdr() {
 noscan_code() {
     curl -sS -m 5 -o /dev/null -w '%{http_code}' -X PURGE \
         -H "xkey-purge: $1" "http://127.0.0.1:$PROXY_PORT/purge-noscan" 2>/dev/null
+}
+
+# <json-path-ish field>: pull an integer field out of the status document
+stat_field() {
+    curl -sS -m 5 "http://127.0.0.1:$PROXY_PORT/status" 2>/dev/null \
+        | tr ',{}' '\n\n\n' | grep "\"$1\":" | head -1 | sed 's/.*: *//'
 }
 
 cached_files() {
@@ -333,6 +343,27 @@ assert_eq "the warmed index answers the next purge" "index" \
 long_tag=$(printf 'a%.0s' $(seq 1 1100))
 assert_eq "an over-long tag is refused" "400" "$(purge_code "$long_tag")"
 
+# The status endpoint reports what the index holds.
+purge_code all >/dev/null
+get_status /a.html >/dev/null
+get_status /b.html >/dev/null
+
+assert_eq "status says the zone is configured" "true" "$(stat_field configured)"
+
+# Each response carries "all" plus its own per-page tag.
+assert_eq "status counts the tags"  "3" "$(stat_field tags)"
+assert_eq "status counts the keys"  "4" "$(stat_field keys)"
+
+purge_code all >/dev/null
+assert_eq "purging a tag removes it from the count" "2" "$(stat_field tags)"
+assert_eq "and its keys with it"                    "2" "$(stat_field keys)"
+
+assert_eq "status reports the zone size" "4194304" "$(stat_field size)"
+
+assert_eq "status refuses a PURGE" "405" \
+    "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X PURGE \
+        "http://127.0.0.1:$PROXY_PORT/status" 2>/dev/null)"
+
 # ------------------------------------------------------------------
 # Index pressure, on a deliberately undersized zone.
 #
@@ -372,6 +403,8 @@ if [ -n "$evictions" ] && [ "$evictions" -gt 0 ]; then
 else
     fail "a full index evicts its coldest tags" "a non-zero count" "${evictions:-none}"
 fi
+
+assert_eq "status reports the evictions" "$evictions" "$(stat_field evictions)"
 
 errors=$(grep -cE '\[(error|crit|alert|emerg)\]' "$PREFIX/logs/error.log" 2>/dev/null || true)
 assert_eq "no errors were logged" "0" "${errors:-0}"
