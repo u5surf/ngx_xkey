@@ -12,7 +12,7 @@ use nginx_sys::{
     ngx_create_hashed_filename, ngx_http_file_cache_node_t, ngx_http_file_cache_t,
     ngx_http_request_t, ngx_int_t, ngx_shmtx_lock, ngx_shmtx_unlock,
 };
-use ngx::core::Status;
+use ngx::core::{SlabPool, Status};
 use ngx::http::{HTTPStatus, HttpModuleLocationConf, HttpModuleMainConf, Request};
 
 use xkey_core::{MAX_TAG_LEN, format_usize, hex_encode, node_key, node_key_rest};
@@ -114,30 +114,42 @@ fn fall_back(request: &mut Request, cache: *mut ngx_http_file_cache_t, tag: &[u8
     }
     let buf = unsafe { core::slice::from_raw_parts_mut(buf.cast::<u8>(), scan::MAX_HEADER_BLOCK) };
 
+    // The scan reads every file's tags on its way past, so hand it the index
+    // to write them back into. The next purge then answers from memory.
+    let index = unsafe { xmcf.shm_zone.as_mut() }.and_then(|zone| {
+        let shared = crate::index::shared(zone).ok()?;
+        let alloc = unsafe { SlabPool::from_shm_zone(zone) }?;
+        Some((shared, alloc))
+    });
+
     let mut s = scan::Scan {
         tag,
         header: xmcf.header.as_bytes(),
         cache,
         buf,
+        index,
         scanned: 0,
         purged: 0,
+        indexed: 0,
     };
 
     if scan::run(&mut s, request.log()) == Status::NGX_ERROR {
         return Status::NGX_ERROR.into();
     }
 
+    let scanned = Some((s.scanned, s.indexed));
+
     if s.purged == 0 {
-        report(request, "scan", 0, Some(s.scanned));
+        report(request, "scan", 0, scanned);
         return HTTPStatus::NOT_FOUND.into();
     }
 
-    report(request, "scan", s.purged, Some(s.scanned));
+    report(request, "scan", s.purged, scanned);
     no_content(request)
 }
 
 /// Reports what the purge did and how it found out.
-fn report(request: &mut Request, source: &str, purged: usize, scanned: Option<usize>) {
+fn report(request: &mut Request, source: &str, purged: usize, scanned: Option<(usize, usize)>) {
     let mut buf = [0u8; 20];
 
     request.add_header_out("x-purge-source", source);
@@ -146,10 +158,16 @@ fn report(request: &mut Request, source: &str, purged: usize, scanned: Option<us
         request.add_header_out("x-purged-count", value);
     }
 
-    if let Some(scanned) = scanned
-        && let Ok(value) = core::str::from_utf8(format_usize(&mut buf, scanned))
-    {
+    let Some((scanned, indexed)) = scanned else {
+        return;
+    };
+
+    if let Ok(value) = core::str::from_utf8(format_usize(&mut buf, scanned)) {
         request.add_header_out("x-scanned-files", value);
+    }
+
+    if let Ok(value) = core::str::from_utf8(format_usize(&mut buf, indexed)) {
+        request.add_header_out("x-indexed-files", value);
     }
 }
 

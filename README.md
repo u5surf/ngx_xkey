@@ -72,8 +72,8 @@ is not enough to empty a cache with an ordinary `GET`.
 | `400` | No `xkey-purge` header on the request |
 | `405` | Not a `PURGE` request |
 
-Every answer says how it was reached. `x-purge-source` is `index` or `scan`,
-and a scan also reports `x-scanned-files`.
+Every answer says how it was reached. `x-purge-source` is `index` or `scan`; a
+scan also reports `x-scanned-files` and `x-indexed-files`.
 
 Restricting the method is a backstop, not access control. The endpoint still
 authenticates nobody, so put it behind `allow` / `deny` or an internal
@@ -95,6 +95,11 @@ That distinction decides how two otherwise nasty problems behave:
   the index warms up again, which it does as entries are served.
 - **Index eviction.** A fixed zone must eventually drop something. Dropping an
   entry costs a scan, never a wrong answer.
+
+A scan reads every surviving file's tags on its way past, so it writes them
+back into the index. One scan therefore both answers the request and warms the
+index, and a following purge is answered from memory. That is how a cold index
+recovers without a separate rebuild pass.
 
 The cost of a scan is one open and one read per cached entry, so it scales with
 how many files the cache zone holds, not with how many match. Turning the
@@ -142,13 +147,11 @@ Both run in CI on every push.
 
 Working: tag recording, purge by tag, shared index across workers, index
 survival across a reload, lazy re-indexing of entries served after a restart,
-the fallback scan, `PURGE`-only endpoints, and reporting which path answered.
+the fallback scan and the index warming it performs, `PURGE`-only endpoints,
+and reporting which path answered.
 
 Not yet implemented:
 
-- **Warming the index from a scan.** A scan already reads every file's tags, so
-  it could repopulate the index on the way past and make the next purge fast.
-  Today the scan answers the request and discards what it learned.
 - **A bound on the index.** Nothing removes a key except purging its tag, so
   entries for evicted cache files accumulate. Growth is capped by the number of
   distinct cache keys ever seen, which for per-URL tags is the whole URL space.

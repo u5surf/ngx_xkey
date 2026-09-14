@@ -16,9 +16,10 @@ use nginx_sys::{
     NGX_HTTP_CACHE_VERSION, ngx_http_file_cache_header_t, ngx_http_file_cache_t, ngx_int_t,
     ngx_log_t, ngx_str_t, ngx_tree_ctx_t, ngx_walk_tree,
 };
-use ngx::core::Status;
-use xkey_core::{CACHE_KEY_LEN, CacheKey, block_has_tag, hex_decode};
+use ngx::core::{SlabPool, Status};
+use xkey_core::{CACHE_KEY_LEN, CacheKey, find_header, hex_decode, split_tags};
 
+use crate::index::Shared;
 use crate::purge;
 
 /// Largest stored header block, bounded by `body_start` being a `u_short`.
@@ -34,10 +35,14 @@ pub struct Scan<'a> {
     pub cache: *mut ngx_http_file_cache_t,
     /// Scratch space for one file's header block, reused across the walk.
     pub buf: &'a mut [u8],
+    /// Index to write back into, and the allocator backing it.
+    pub index: Option<(&'a Shared, SlabPool)>,
     /// Files visited.
     pub scanned: usize,
     /// Entries invalidated.
     pub purged: usize,
+    /// Files whose tags were written back into the index.
+    pub indexed: usize,
 }
 
 /// Walks the cache directory, purging every entry carrying the scan's tag.
@@ -79,22 +84,61 @@ unsafe extern "C" fn on_file(ctx: *mut ngx_tree_ctx_t, name: *mut ngx_str_t) -> 
     // SAFETY: ngx_walk_tree hands out NUL-terminated paths.
     let path = name.data.cast::<c_char>();
 
-    let Some(block) = (unsafe { read_header_block(path, scan.buf) }) else {
+    let Some(block_len) = (unsafe { read_header_block(path, scan.buf) }) else {
         return Status::NGX_OK.into();
     };
 
-    if !block_has_tag(&scan.buf[..block], scan.header, scan.tag) {
+    // Field-wise borrows: the block is read-only from here, while the counters
+    // and the index handle are written.
+    let Scan {
+        tag,
+        header,
+        cache,
+        buf,
+        index,
+        purged,
+        indexed,
+        ..
+    } = scan;
+    let block = &buf[..block_len];
+
+    let Some(tags) = find_header(block, header) else {
+        return Status::NGX_OK.into();
+    };
+
+    if split_tags(tags).any(|t| t == *tag) {
+        // On the scan path the file is the record, so removing it is what
+        // counts as a purge. Clearing the shared-memory node is best-effort:
+        // right after a restart the cache loader may not have added it yet.
+        let cleared = unsafe { purge::invalidate(&mut **cache, &key) };
+        let unlinked = unsafe { libc::unlink(path) } == 0;
+
+        if cleared || unlinked {
+            *purged += 1;
+        }
+
         return Status::NGX_OK.into();
     }
 
-    // On the scan path the file is the record, so removing it is what counts
-    // as a purge. Clearing the shared-memory node is best-effort: right after
-    // a restart the cache loader may not have added it yet.
-    let cleared = unsafe { purge::invalidate(&mut *scan.cache, &key) };
-    let unlinked = unsafe { libc::unlink(path) } == 0;
+    // The file survives, so record what it was already carrying. A scan reads
+    // every file's tags anyway; writing them back is what stops the next purge
+    // from having to scan again.
+    if let Some((shared, alloc)) = index {
+        let mut idx = shared.write();
+        let mut wrote = false;
 
-    if cleared || unlinked {
-        scan.purged += 1;
+        for t in split_tags(tags) {
+            // A full zone is not a scan failure: the answer above is already
+            // correct, only the next lookup stays slow.
+            if crate::index::insert(&mut idx, alloc, t, &key).is_err() {
+                break;
+            }
+            wrote = true;
+        }
+
+        if wrote {
+            *indexed += 1;
+        }
     }
 
     Status::NGX_OK.into()
@@ -108,7 +152,7 @@ unsafe extern "C" fn on_file(ctx: *mut ngx_tree_ctx_t, name: *mut ngx_str_t) -> 
 fn key_from_path(name: &ngx_str_t) -> Option<CacheKey> {
     const HEX_LEN: usize = 2 * CACHE_KEY_LEN;
 
-    let path = unsafe { name.as_bytes() };
+    let path = name.as_bytes();
     if path.len() < HEX_LEN {
         return None;
     }

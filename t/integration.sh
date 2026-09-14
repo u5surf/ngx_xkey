@@ -96,6 +96,8 @@ echo one   > "$PREFIX/origin/a.html"
 echo two   > "$PREFIX/origin/b.html"
 echo three > "$PREFIX/origin/c.html"
 echo four  > "$PREFIX/origin/d.html"
+echo five  > "$PREFIX/origin/e.html"
+echo six   > "$PREFIX/origin/f.html"
 
 cat > "$PREFIX/conf/nginx.conf" <<EOF
 load_module modules/ngx_http_xkey_module.so;
@@ -178,6 +180,17 @@ purge_header() {
     curl -sS -m 5 -o /dev/null -D - -X PURGE \
         -H "xkey-purge: $1" "http://127.0.0.1:$PROXY_PORT/purge" 2>/dev/null \
         | grep -i "^$2:" | tr -d '\r' | awk '{print $2}'
+}
+
+# <tag> <outfile>: purge once, saving the response headers for inspection
+purge_into() {
+    curl -sS -m 5 -o /dev/null -D "$2" -X PURGE \
+        -H "xkey-purge: $1" "http://127.0.0.1:$PROXY_PORT/purge" 2>/dev/null
+}
+
+# <file> <header>
+hdr() {
+    grep -i "^$2:" "$1" | tr -d '\r' | awk '{print $2}'
 }
 
 noscan_code() {
@@ -295,6 +308,27 @@ assert_eq "and reports how many files it read" "1" \
     "$(purge_header 'page-/c.html' x-scanned-files)"
 
 assert_eq "an unknown tag is still a miss after scanning" "404" "$(purge_code no-such-tag)"
+
+# A scan reads every surviving file's tags on the way past, so it repopulates
+# the index and the next purge does not have to scan again.
+get_status /e.html >/dev/null
+get_status /f.html >/dev/null
+before=$(cached_files)
+
+stop_nginx
+start_nginx
+
+purge_into 'page-/e.html' "$WORK/purge.hdr"
+
+assert_eq "the scan reads every cached file" "$before" \
+    "$(hdr "$WORK/purge.hdr" x-scanned-files)"
+assert_eq "and indexes the ones it keeps" "$((before - 1))" \
+    "$(hdr "$WORK/purge.hdr" x-indexed-files)"
+assert_eq "leaving the rest cached" "$((before - 1))" "$(cached_files)"
+
+# f.html was indexed by that scan, so purging it needs no second walk.
+assert_eq "the warmed index answers the next purge" "index" \
+    "$(purge_header 'page-/f.html' x-purge-source)"
 
 long_tag=$(printf 'a%.0s' $(seq 1 1100))
 assert_eq "an over-long tag is refused" "400" "$(purge_code "$long_tag")"
