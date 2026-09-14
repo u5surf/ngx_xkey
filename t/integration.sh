@@ -333,6 +333,46 @@ assert_eq "the warmed index answers the next purge" "index" \
 long_tag=$(printf 'a%.0s' $(seq 1 1100))
 assert_eq "an over-long tag is refused" "400" "$(purge_code "$long_tag")"
 
+# ------------------------------------------------------------------
+# Index pressure, on a deliberately undersized zone.
+#
+# 128k is the smallest shared zone NGINX accepts on a 16k-page host. Each
+# request below carries a distinct kilobyte-long per-page tag, so the index
+# fills quickly and has to start evicting.
+
+stop_nginx
+rm -rf "$CACHE"
+mkdir -p "$CACHE"
+sed -e 's/^    xkey_zone xkey:4m;/    xkey_zone xkey:128k;/' \
+    "$PREFIX/conf/nginx.conf" > "$PREFIX/conf/small.conf"
+cp "$PREFIX/conf/small.conf" "$PREFIX/conf/nginx.conf"
+start_nginx
+
+pad=$(printf 'p%.0s' $(seq 1 900))
+i=0
+while [ $i -lt 200 ]; do
+    curl -sS -m 5 -o /dev/null "http://127.0.0.1:$PROXY_PORT/a.html?n=$i&$pad" 2>/dev/null
+    i=$((i + 1))
+done
+
+# Probe through the endpoint that never scans, so that asking what the index
+# holds does not repopulate it.
+assert_eq "the newest tag survived eviction" "204" "$(noscan_code "page-/a.html?n=199&$pad")"
+assert_eq "the oldest tag was evicted"       "404" "$(noscan_code "page-/a.html?n=0&$pad")"
+
+# The evicted tag is still purgeable, just slowly.
+assert_eq "an evicted tag still purges, via the scan" "scan" \
+    "$(purge_header "page-/a.html?n=0&$pad" x-purge-source)"
+
+purge_into "page-/a.html?n=1&$pad" "$WORK/pressure.hdr"
+evictions=$(hdr "$WORK/pressure.hdr" x-index-evictions)
+
+if [ -n "$evictions" ] && [ "$evictions" -gt 0 ]; then
+    ok "a full index evicts its coldest tags"
+else
+    fail "a full index evicts its coldest tags" "a non-zero count" "${evictions:-none}"
+fi
+
 errors=$(grep -cE '\[(error|crit|alert|emerg)\]' "$PREFIX/logs/error.log" 2>/dev/null || true)
 assert_eq "no errors were logged" "0" "${errors:-0}"
 

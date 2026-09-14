@@ -73,7 +73,9 @@ is not enough to empty a cache with an ordinary `GET`.
 | `405` | Not a `PURGE` request |
 
 Every answer says how it was reached. `x-purge-source` is `index` or `scan`; a
-scan also reports `x-scanned-files` and `x-indexed-files`.
+scan also reports `x-scanned-files` and `x-indexed-files`. An index that has
+had to discard anything reports `x-index-evictions` and `x-index-drops`, so a
+zone that is too small for its traffic says so instead of degrading quietly.
 
 Restricting the method is a backstop, not access control. The endpoint still
 authenticates nobody, so put it behind `allow` / `deny` or an internal
@@ -93,8 +95,12 @@ That distinction decides how two otherwise nasty problems behave:
 - **A cold index after a restart.** Shared memory does not survive a full stop
   and start, while the cache on disk does. Purges fall back to scanning until
   the index warms up again, which it does as entries are served.
-- **Index eviction.** A fixed zone must eventually drop something. Dropping an
-  entry costs a scan, never a wrong answer.
+- **Index eviction.** NGINX gives no notification when it drops a cache entry,
+  so nothing would ever remove the index's reference to it. The index keeps an
+  LRU over tags and evicts the coldest to make room for what is being recorded
+  now, which is only safe because dropping an entry costs a scan rather than a
+  wrong answer. A tag also caps how many keys it will hold, so one per-URL tag
+  cannot crowd out every other.
 
 A scan reads every surviving file's tags on its way past, so it writes them
 back into the index. One scan therefore both answers the request and warms the
@@ -147,16 +153,11 @@ Both run in CI on every push.
 
 Working: tag recording, purge by tag, shared index across workers, index
 survival across a reload, lazy re-indexing of entries served after a restart,
-the fallback scan and the index warming it performs, `PURGE`-only endpoints,
-and reporting which path answered.
+the fallback scan and the index warming it performs, LRU eviction under zone
+pressure, `PURGE`-only endpoints, and reporting which path answered.
 
 Not yet implemented:
 
-- **A bound on the index.** Nothing removes a key except purging its tag, so
-  entries for evicted cache files accumulate. Growth is capped by the number of
-  distinct cache keys ever seen, which for per-URL tags is the whole URL space.
-  A full zone currently drops new associations silently. It needs a cap, LRU
-  eviction over tags, and a counter for what it dropped.
 - **Soft purge.** Expiring an entry rather than deleting it, so
   `proxy_cache_use_stale` can keep serving while it revalidates.
 - **Vary variants.** Variants are stored under a different key; all of them share

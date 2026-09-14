@@ -75,11 +75,9 @@ fn record(request: &mut Request) {
 
     let mut index = shared.write();
     for tag in xkey_core::split_tags(tags) {
-        if index::insert(&mut index, &alloc, tag, &key).is_err() {
-            // The zone is full.  Dropping the association is the honest
-            // outcome: a later purge for this tag will miss the entry.
-            break;
-        }
+        // One tag failing must not stop the others: they are independent, and
+        // a later purge for whichever got dropped falls back to a scan.
+        let _ = index.insert(&alloc, tag, &key);
     }
 }
 

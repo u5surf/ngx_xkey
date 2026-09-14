@@ -17,7 +17,7 @@ use ngx::http::{HTTPStatus, HttpModuleLocationConf, HttpModuleMainConf, Request}
 
 use xkey_core::{MAX_TAG_LEN, format_usize, hex_encode, node_key, node_key_rest};
 
-use crate::{CACHE_KEY_LEN, CacheKey, HttpXkeyModule, index, scan};
+use crate::{CACHE_KEY_LEN, CacheKey, HttpXkeyModule, scan};
 
 /// Request header naming the tag to purge.
 const PURGE_HEADER: &[u8] = b"xkey-purge";
@@ -68,9 +68,15 @@ pub unsafe extern "C" fn handler(r: *mut ngx_http_request_t) -> ngx_int_t {
 
     // Take the whole set under one write lock, then release it before doing
     // any filesystem work.
-    let keys = {
+    let (keys, pressure) = {
         let mut idx = shared.write();
-        index::take(&mut idx, tag)
+        (
+            idx.take(tag),
+            Pressure {
+                evicted: idx.evicted,
+                dropped: idx.dropped,
+            },
+        )
     };
 
     let Some(keys) = keys else {
@@ -87,8 +93,20 @@ pub unsafe extern "C" fn handler(r: *mut ngx_http_request_t) -> ngx_int_t {
         }
     }
 
-    report(request, "index", purged, None);
+    report(request, "index", purged, None, pressure);
     no_content(request)
+}
+
+/// How much the index has had to discard, over the life of the zone.
+///
+/// Reported only when non-zero, so that a healthy purge stays quiet and a
+/// zone that is too small for its traffic says so.
+#[derive(Clone, Copy, Default)]
+struct Pressure {
+    /// Tags evicted to make room.
+    evicted: u64,
+    /// Keys dropped because a tag reached its cap.
+    dropped: u64,
 }
 
 /// Answers from the cache directory when the index has nothing for the tag.
@@ -138,36 +156,55 @@ fn fall_back(request: &mut Request, cache: *mut ngx_http_file_cache_t, tag: &[u8
     }
 
     let scanned = Some((s.scanned, s.indexed));
+    let pressure = s
+        .index
+        .map(|(shared, _)| {
+            let idx = shared.read();
+            Pressure {
+                evicted: idx.evicted,
+                dropped: idx.dropped,
+            }
+        })
+        .unwrap_or_default();
 
     if s.purged == 0 {
-        report(request, "scan", 0, scanned);
+        report(request, "scan", 0, scanned, pressure);
         return HTTPStatus::NOT_FOUND.into();
     }
 
-    report(request, "scan", s.purged, scanned);
+    report(request, "scan", s.purged, scanned, pressure);
     no_content(request)
 }
 
 /// Reports what the purge did and how it found out.
-fn report(request: &mut Request, source: &str, purged: usize, scanned: Option<(usize, usize)>) {
-    let mut buf = [0u8; 20];
-
+fn report(
+    request: &mut Request,
+    source: &str,
+    purged: usize,
+    scanned: Option<(usize, usize)>,
+    pressure: Pressure,
+) {
     request.add_header_out("x-purge-source", source);
+    count(request, "x-purged-count", purged);
 
-    if let Ok(value) = core::str::from_utf8(format_usize(&mut buf, purged)) {
-        request.add_header_out("x-purged-count", value);
+    if let Some((scanned, indexed)) = scanned {
+        count(request, "x-scanned-files", scanned);
+        count(request, "x-indexed-files", indexed);
     }
 
-    let Some((scanned, indexed)) = scanned else {
-        return;
-    };
-
-    if let Ok(value) = core::str::from_utf8(format_usize(&mut buf, scanned)) {
-        request.add_header_out("x-scanned-files", value);
+    if pressure.evicted != 0 {
+        count(request, "x-index-evictions", pressure.evicted as usize);
     }
 
-    if let Ok(value) = core::str::from_utf8(format_usize(&mut buf, indexed)) {
-        request.add_header_out("x-indexed-files", value);
+    if pressure.dropped != 0 {
+        count(request, "x-index-drops", pressure.dropped as usize);
+    }
+}
+
+fn count(request: &mut Request, name: &str, n: usize) {
+    let mut buf = [0u8; 20];
+    if let Ok(value) = core::str::from_utf8(format_usize(&mut buf, n)) {
+        request.add_header_out(name, value);
     }
 }
 

@@ -130,10 +130,7 @@ unsafe extern "C" fn on_file(ctx: *mut ngx_tree_ctx_t, name: *mut ngx_str_t) -> 
         for t in split_tags(tags) {
             // A full zone is not a scan failure: the answer above is already
             // correct, only the next lookup stays slow.
-            if crate::index::insert(&mut idx, alloc, t, &key).is_err() {
-                break;
-            }
-            wrote = true;
+            wrote |= idx.insert(alloc, t, &key).is_ok();
         }
 
         if wrote {
